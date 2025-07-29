@@ -121,8 +121,8 @@ function setup_neovim_linux_appimage() {
 	"$nvim_appimage_temp_path" --appimage-extract >/dev/null
 
 	info "Finishing up installing Neovim..."
-	mkdir -p "$nvim_version_dir"/bin
 	mv -f "$temp_dir/squashfs-root"/* "$nvim_version_dir"
+	mkdir -p "$nvim_version_dir"/bin
 	ln -sf "$nvim_version_dir"/usr/bin/nvim "$nvim_binary"
 }
 
