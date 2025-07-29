@@ -1,259 +1,274 @@
 local M = {}
+local constants = require("remote-nvim.constants")
+M.uv = vim.fn.has("nvim-0.10") and vim.uv or vim.loop
+---@type plenary.logger
+M.logger = nil
 
-M.uv = vim.uv or vim.loop
-M.is_windows = vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1
+---Is the current system a Windows system or not
+M.is_windows = vim.fn.has("win32") == 1 or vim.fn.has("win32unix") == 1
+M.path_separator = M.is_windows and "\\" or "/"
 
----Join path segments based on OS
----@param is_windows boolean Whether the system is Windows
----@param ... string Path segments to join
----@return string joined_path The joined path
-function M.path_join(is_windows, ...)
-  local segments = { ... }
-  local separator = is_windows and "\\" or "/"
-  
-  -- Filter out empty segments and normalize
-  local filtered_segments = {}
-  for _, segment in ipairs(segments) do
-    if segment and segment ~= "" then
-      -- Remove leading/trailing separators from middle segments
-      segment = segment:gsub("^[/\\]+", ""):gsub("[/\\]+$", "")
-      if segment ~= "" then
-        table.insert(filtered_segments, segment)
-      end
-    end
+function M.get_plugin_version()
+  local commit_id = "N/A"
+  if
+    vim.fn.executable("git") == 1
+    and #vim.fs.find(".git", { path = M.get_plugin_root(), type = "directory", limit = 1 }) == 1
+  then
+    commit_id = vim.split(vim.fn.system("git rev-parse HEAD"), "\n")[1]
   end
-  
-  return table.concat(filtered_segments, separator)
+  return ("%s (%s)"):format(constants.PLUGIN_VERSION, commit_id)
 end
 
----Get the plugin root directory
----@return string plugin_root Path to the plugin root directory
-function M.get_plugin_root()
-  local info = debug.getinfo(1, "S")
-  local script_path = info.source:sub(2) -- Remove the '@' prefix
-  -- Go up from lua/remote-nvim/utils.lua to the plugin root
-  return vim.fn.fnamemodify(script_path, ":h:h:h")
-end
-
----Truncate log file if it exceeds the maximum size
-function M.truncate_log()
-  local remote_nvim = require("remote-nvim")
-  local log_path = remote_nvim.config.log.filepath
-  local max_size = remote_nvim.config.log.max_size
-  
-  if vim.fn.filereadable(log_path) == 1 then
-    local size = vim.fn.getfsize(log_path)
-    if size > max_size then
-      vim.fn.writefile({}, log_path)
-    end
-  end
-end
-
----Get logger instance for the plugin
----@return table logger Logger instance with logging methods
+---Get logger
+---@return plenary.logger logger Logger instance
 function M.get_logger()
-  local logger = {}
-  
-  local function log_message(level, message)
-    -- Simple logging that uses vim.notify for now
-    -- This can be enhanced later to write to log files
-    vim.schedule(function()
-      vim.notify(("[%s] %s"):format(level, message), vim.log.levels[level:upper()] or vim.log.levels.INFO)
-    end)
-  end
-  
-  logger.info = function(message) log_message("info", message) end
-  logger.debug = function(message) log_message("debug", message) end
-  logger.warn = function(message) log_message("warn", message) end
-  logger.error = function(message) log_message("error", message) end
-  
-  return logger
-end
+  local remote_nvim = require("remote-nvim")
 
----Get user input
----@param input_label string Label for the input box
----@param input_type prompt_type? What kind of value would be typed as input
----@return string response User response
-function M.get_input(input_label, input_type)
-  input_type = input_type or "plain"
-
-  if input_type == "secret" then
-    return vim.fn.inputsecret(input_label)
-  else
-    return vim.fn.input(input_label)
-  end
-end
-
----Get selection handling coroutines
----@param choices string[]
----@param selection_opts table
----@return string? selected_choice Selected choice
-function M.get_selection(choices, selection_opts)
-  local co = coroutine.running()
-  local selection_made = false
-  local selected_choice = nil
-
-  vim.schedule(function()
-    vim.ui.select(choices, selection_opts, function(choice)
-      selection_made = true
-      selected_choice = choice
-      if co then
-        coroutine.resume(co)
-      end
-    end)
-  end)
-
-  if co and not selection_made then
-    coroutine.yield()
-  end
-  return selected_choice
-end
-
----Get Neovim versions that satisfy the minimum neovim version constraint
----@return table<string, string>[] valid_neovim_versions Valid Neovim versions supported by the plugin
-function M.get_valid_neovim_versions()
-  local res
-  local co = coroutine.running()
-  if co then
-    require("plenary.curl").get("https://api.github.com/repos/neovim/neovim/releases", {
-      headers = {
-        accept = "application/vnd.github+json",
-      },
-      callback = function(out)
-        res = out
-        coroutine.resume(co)
+  return M.logger ~= nil and M.logger
+    or require("plenary.log").new({
+      plugin = constants.PLUGIN_NAME,
+      level = remote_nvim.config.log.level,
+      use_console = false,
+      outfile = remote_nvim.config.log.filepath,
+      fmt_msg = function(_, mode_name, src_path, src_line, msg)
+        local nameupper = mode_name:upper()
+        local lineinfo = vim.fn.fnamemodify(src_path, ":.") .. ":" .. src_line
+        return string.format("%-6s%s %s: %s\n", nameupper, os.date(), lineinfo, msg)
       end,
     })
-    coroutine.yield()
-  else
-    res = require("plenary.curl").get("https://api.github.com/repos/neovim/neovim/releases", {
-      headers = {
-        accept = "application/vnd.github+json",
-      },
-    })
-  end
-  local resp = vim.json.decode(res.body)
-
-  local valid_versions = {}
-  local nightly_commit_id = ""
-  table.insert(valid_versions, { tag = "stable" })
-  for _, version in ipairs(resp) do
-    local version_name = version["tag_name"]
-
-    if not vim.tbl_contains({ "stable", "nightly" }, version_name) then
-      table.insert(valid_versions, { tag = version_name, commit = version["target_commitish"] })
-    elseif version_name == "nightly" then
-      nightly_commit_id = version["target_commitish"]
-    elseif version_name == "stable" then
-      valid_versions[1].commit = version["target_commitish"]
-    end
-  end
-  table.insert(valid_versions, { tag = "nightly", commit = nightly_commit_id })
-
-  return valid_versions
 end
 
----Get an ephemeral free port on the local machine
----@return string port A free ephemeral port available for TCP connections
-function M.find_free_port()
-  local socket = require("remote-nvim.utils").uv.new_tcp()
-
-  socket:bind("127.0.0.1", 0)
-  local result = socket.getsockname(socket)
-  socket:close()
-
-  if not result then
-    error("Failed to find a free port")
-  end
-
-  return tostring(result["port"])
-end
-
-local function is_later_neovim_version(version1, version2)
-  local pattern = "v(%d+)%.(%d+)%.(%d+)"
-
-  local major1, minor1, patch1 = version1:match(pattern)
-  local major2, minor2, patch2 = version2:match(pattern)
-
-  major1, minor1, patch1 = tonumber(major1), tonumber(minor1), tonumber(patch1)
-  major2, minor2, patch2 = tonumber(major2), tonumber(minor2), tonumber(patch2)
-
-  assert(patch1 ~= nil, ("Invalid version passed '%s'"):format(version1))
-  assert(patch2 ~= nil, ("Invalid version passed '%s'"):format(version2))
-
-  if major1 == major2 then
-    if minor1 == minor2 then
-      return patch1 > patch2
-    else
-      return minor1 > minor2
-    end
-  else
-    return major1 > major2
-  end
-end
-
-function M.is_greater_neovim_version(version1, version2)
-  -- Order would be as follows
-  -- 1. Stable
-  -- 2. Any recognized Neovim version of format vX.Y.Z
-  -- 3. Nightly
-  local specialVersions = { ["nightly"] = 1, ["stable"] = 2 }
-
-  if specialVersions[version1] then
-    if specialVersions[version2] then
-      return specialVersions[version1] > specialVersions[version2]
-    else
-      return version1 == "stable"
-    end
-  elseif specialVersions[version2] then
-    return version2 ~= "stable"
-  else
-    return is_later_neovim_version(version1, version2)
-  end
-end
-
----@param os os_type OS name
----@param version string Release version
----@param arch arch_type Release version
----@param release_type neovim_install_method Release type
-function M.get_offline_neovim_release_name(os, version, arch, release_type)
-  if release_type == "source" then
-    return ("nvim-%s-source.tar.gz"):format(version)
-  elseif release_type == "system" then
-    error("There are no system type neovim releases")
-  end
-
-  if os == "Linux" then
-    if (version == "nightly") or (version ~= "stable" and is_later_neovim_version(version, "v0.10.3")) then
-      return ("nvim-%s-linux-%s.appimage"):format(version, arch)
-    end
-    return ("nvim-%s-linux.appimage"):format(version)
-  elseif os == "macOS" then
-    if (version == "nightly") or (version ~= "stable" and is_later_neovim_version(version, "v0.9.5")) then
-      return ("nvim-%s-macos-%s.tar.gz"):format(version, arch)
-    end
-    return ("nvim-%s-macos.tar.gz"):format(version)
-  else
-    error(("Unsupported OS: %s"):format(os))
-  end
-end
-
----@param kernel_name os_type Name of the kernel
----@param arch string Arch platforms
-function M.is_binary_release_available(kernel_name, arch)
-  if kernel_name == "macOS" or kernel_name == "Windows" then
+---Find if provided binary exists or not
+---@param binary string|string[] Name of the binary to search on the runtime path
+---@return boolean exists Does the binary exist on the path
+function M.find_binary(binary)
+  binary = type(binary) == "string" and { binary } or binary
+  if vim.fn.executable(binary[1]) == 1 then
     return true
   end
+  return false
+end
 
-  local unsupported_archs = { "arm", "risc", "aarch" }
+---Generate a random string of given length
+---@param length integer Length of the string to be generated
+---@return string random_string Random string of the given length
+function M.generate_random_string(length)
+  local charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+  math.randomseed(os.time()) -- Seed the random number generator with the current time
+  local random_string = ""
 
-  -- Neovim currently does not provide binaries for ARM or RISC
-  return (
-    kernel_name == "Linux"
-    and vim.tbl_isempty(vim.tbl_filter(function(unsupported_arch)
-      return string.find(arch, unsupported_arch) ~= nil
-    end, unsupported_archs))
-  )
+  for _ = 1, length do
+    local rand_index = math.random(1, #charset)
+    random_string = random_string .. string.sub(charset, rand_index, rand_index)
+  end
+
+  return random_string
+end
+
+---Split string into a table of strings using a separator.
+---Credits: https://github.com/nvim-neo-tree/neo-tree.nvim/blob/main/lua/neo-tree/utils.lua#L776-L789
+---@param inputString string The string to split.
+---@param sep string Separator by which to split the string
+---@return table table A table of strings.
+function M.split(inputString, sep)
+  local fields = {}
+
+  local pattern = string.format("([^%s]+)", sep)
+  local _ = string.gsub(inputString, pattern, function(c)
+    fields[#fields + 1] = c
+  end)
+
+  return fields
+end
+
+---Joins arbitrary number of paths together.
+---Credits: https://github.com/nvim-neo-tree/neo-tree.nvim/blob/main/lua/neo-tree/utils.lua#L817-L840
+---@param is_windows boolean Are the paths on a Windows machine
+---@param ... string The paths to join.
+---@return string
+function M.path_join(is_windows, ...)
+  local path_separator = is_windows and "\\" or "/"
+  local args = { ... }
+  if #args == 0 then
+    return ""
+  end
+
+  local all_parts = {}
+  if type(args[1]) == "string" and args[1]:sub(1, 1) == path_separator then
+    all_parts[1] = ""
+  end
+
+  for _, arg in ipairs(args) do
+    if arg == "" and #all_parts == 0 and not is_windows then
+      all_parts = { "" }
+    else
+      local arg_parts = M.split(arg, path_separator)
+      vim.list_extend(all_parts, arg_parts)
+    end
+  end
+  return table.concat(all_parts, path_separator)
+end
+
+---Convert list into equally spaced columns of given number ready to be printed
+---@param token_arr string[] List containing the string tokens
+---@param num number Number of columns to be created
+---@return string[] spaced_arr Formatted list containing the formatted string tokens
+function M.generate_equally_spaced_columns(token_arr, num)
+  -- Create lists for the grouped elements
+  local col_grouped_list = {}
+
+  for i = 1, num do
+    col_grouped_list[i] = {}
+  end
+
+  -- Fill the grouped lists
+  for i, value in ipairs(token_arr) do
+    local groupIndex = (i - 1) % num + 1
+    table.insert(col_grouped_list[groupIndex], value)
+  end
+
+  --Calculate the size of each column
+  local col_widths = {}
+  for _, col in ipairs(col_grouped_list) do
+    local max_width = 0
+    for _, item in ipairs(col) do
+      local item_width = #tostring(item)
+      max_width = math.max(max_width, item_width)
+    end
+    table.insert(col_widths, max_width)
+  end
+
+  -- Generate formatted lines with proper spacing
+  local formatted_lines = {}
+  for i = 1, math.ceil(#token_arr / num) do
+    local formatted_row = ""
+    for j = 1, num do
+      local index = (i - 1) * num + j
+      if index <= #token_arr then
+        local item_str = tostring(token_arr[index])
+        local padding = col_widths[j] - #item_str
+        formatted_row = formatted_row .. item_str .. string.rep(" ", padding) .. "    "
+      else
+        formatted_row = formatted_row .. string.rep(" ", col_widths[j] + 4)
+      end
+    end
+    table.insert(formatted_lines, formatted_row)
+  end
+
+  return formatted_lines
+end
+
+---Truncate the plugin log file
+function M.truncate_log()
+  local remote_nvim = require("remote-nvim")
+  local stat = M.uv.fs_stat(remote_nvim.config.log.filepath)
+  if stat and stat.size > remote_nvim.config.log.max_size then
+    io.open(remote_nvim.config.log.filepath, "w+"):close()
+  end
+end
+
+---Get OS name of the system
+---@return string os_name Name of the OS
+function M.os_name()
+  local os_name = M.uv.os_uname().sysname
+
+  if os_name == "Darwin" then
+    return "macOS"
+  end
+  return os_name
+end
+
+---Get local client's neovim version
+---@return string version Local client Neovim version
+function M.neovim_version()
+  local neovim_version = vim.version()
+  local neovim_version_str = ("%d.%d.%d"):format(neovim_version.major, neovim_version.minor, neovim_version.patch)
+  if neovim_version.prerelease then
+    neovim_version_str = ("%s-%s"):format(neovim_version_str, neovim_version.prerelease)
+  end
+  return neovim_version_str
+end
+
+function M.get_plugin_root()
+  return vim.fn.fnamemodify(debug.getinfo(1).source:sub(2), ":h:h:h")
+end
+
+---Find common parent directory for all passed paths
+---@param paths string[] Paths which would be used to calculate common ancestor
+---@return string?, string[] paths Common ancestor directory; paths relative to parent directory
+function M.find_common_parent(paths)
+  if #paths == 0 then
+    return "", {}
+  end
+  local input_paths = {}
+  for _, input_path in ipairs(paths) do
+    table.insert(input_paths, vim.split(input_path, M.path_separator, { plain = true }))
+  end
+
+  if #input_paths == 1 then
+    local only_path = input_paths[1]
+    return table.concat(only_path, M.path_separator, 1, #only_path - 1), { only_path[#only_path] }
+  end
+
+  -- We start with the assumption that entire path match
+  local end_index = #input_paths[1]
+  local anscestor_path = vim.deepcopy(input_paths[1])
+
+  -- We trim it down to the min matching index
+  for _, path in ipairs(vim.list_slice(input_paths, 2)) do
+    local idx = 1
+    while idx <= #path do
+      if idx > end_index or anscestor_path[idx] ~= path[idx] then
+        break
+      end
+      idx = idx + 1
+    end
+    end_index = math.min(end_index, idx - 1)
+  end
+
+  local parent_dir = table.concat(input_paths[1], M.path_separator, 1, end_index)
+  local sub_dirs = {}
+  for _, path in ipairs(input_paths) do
+    table.insert(sub_dirs, table.concat(path, M.path_separator, end_index + 1))
+  end
+
+  return parent_dir, sub_dirs
+end
+
+---Substitute substring in one string with another
+---@param str string String in which substituion should happen
+---@param sub_str string String to be substituted
+---@param repl string Replacement string
+---@param times number? How many times must the repetitions be applied
+---@return string res_str String to return
+function M.plain_substitute(str, sub_str, repl, times)
+  local strMagic = "([%^%$%(%)%%%.%[%]%*%+%-%?])"
+  local replaced_str = str:gsub((sub_str or ""):gsub(strMagic, "%%%1"), repl, times or 1)
+  return replaced_str
+end
+
+---Run cmd async
+---@param cmd string Command to run
+---@param args string[] Arguments to pass to the command
+---@param cb function<string[]>? Callback function
+---@return Job cmd_job Job executing the command async
+function M.run_cmd(cmd, args, cb)
+  local job = require("plenary.job"):new({
+    command = cmd,
+    args = args,
+    enabled_recording = true,
+    on_exit = function(self, code)
+      if code ~= 0 then
+        error(table.concat(self:stderr_result(), "\n"))
+      end
+      if cb ~= nil then
+        cb(self:result())
+      end
+    end,
+  })
+
+  job:start()
+  return job
 end
 
 return M
