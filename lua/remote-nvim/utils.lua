@@ -49,6 +49,27 @@ function M.truncate_log()
   end
 end
 
+---Get logger instance for the plugin
+---@return table logger Logger instance with logging methods
+function M.get_logger()
+  local logger = {}
+  
+  local function log_message(level, message)
+    -- Simple logging that uses vim.notify for now
+    -- This can be enhanced later to write to log files
+    vim.schedule(function()
+      vim.notify(("[%s] %s"):format(level, message), vim.log.levels[level:upper()] or vim.log.levels.INFO)
+    end)
+  end
+  
+  logger.info = function(message) log_message("info", message) end
+  logger.debug = function(message) log_message("debug", message) end
+  logger.warn = function(message) log_message("warn", message) end
+  logger.error = function(message) log_message("error", message) end
+  
+  return logger
+end
+
 ---Get user input
 ---@param input_label string Label for the input box
 ---@param input_type prompt_type? What kind of value would be typed as input
