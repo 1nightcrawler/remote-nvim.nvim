@@ -1,5 +1,54 @@
 local M = {}
 
+M.uv = vim.uv or vim.loop
+M.is_windows = vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1
+
+---Join path segments based on OS
+---@param is_windows boolean Whether the system is Windows
+---@param ... string Path segments to join
+---@return string joined_path The joined path
+function M.path_join(is_windows, ...)
+  local segments = { ... }
+  local separator = is_windows and "\\" or "/"
+  
+  -- Filter out empty segments and normalize
+  local filtered_segments = {}
+  for _, segment in ipairs(segments) do
+    if segment and segment ~= "" then
+      -- Remove leading/trailing separators from middle segments
+      segment = segment:gsub("^[/\\]+", ""):gsub("[/\\]+$", "")
+      if segment ~= "" then
+        table.insert(filtered_segments, segment)
+      end
+    end
+  end
+  
+  return table.concat(filtered_segments, separator)
+end
+
+---Get the plugin root directory
+---@return string plugin_root Path to the plugin root directory
+function M.get_plugin_root()
+  local info = debug.getinfo(1, "S")
+  local script_path = info.source:sub(2) -- Remove the '@' prefix
+  -- Go up from lua/remote-nvim/utils.lua to the plugin root
+  return vim.fn.fnamemodify(script_path, ":h:h:h")
+end
+
+---Truncate log file if it exceeds the maximum size
+function M.truncate_log()
+  local remote_nvim = require("remote-nvim")
+  local log_path = remote_nvim.config.log.filepath
+  local max_size = remote_nvim.config.log.max_size
+  
+  if vim.fn.filereadable(log_path) == 1 then
+    local size = vim.fn.getfsize(log_path)
+    if size > max_size then
+      vim.fn.writefile({}, log_path)
+    end
+  end
+end
+
 ---Get user input
 ---@param input_label string Label for the input box
 ---@param input_type prompt_type? What kind of value would be typed as input
