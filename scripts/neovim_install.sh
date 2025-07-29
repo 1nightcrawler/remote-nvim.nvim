@@ -1,241 +1,200 @@
 #!/usr/bin/env bash
 
 # If anything fails, exit
-set -eoE pipefail
+set -eo pipefail
 
-SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+# Check if either curl or wget is available on the system
+if command -v curl &>/dev/null; then
+	downloader="curl"
+elif command -v wget &>/dev/null; then
+	downloader="wget"
+else
+	echo "Error: This script requires either curl or wget to be installed."
+	exit 1
+fi
 
-# shellcheck source=SCRIPTDIR/utils/core.sh
-source "${SCRIPTS_DIR}/utils/core.sh"
-# shellcheck source=SCRIPTDIR/utils/api.sh
-source "${SCRIPTS_DIR}/utils/api.sh"
-# shellcheck source=SCRIPTDIR/utils/neovim.sh
-source "${SCRIPTS_DIR}/utils/neovim.sh"
-
-download_neovim_script="$SCRIPTS_DIR/neovim_download.sh"
-nvim_version_dir=""
-nvim_binary=""
-remote_nvim_dir=""
-nvim_version=""
-force_installation=""
-install_method=""
-offline_mode=""
-arch_type=""
-
-# Create a temporary directory to handle any remote nvim data location things
-temp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t 'neovim_download')
-
-cleanup_function() {
-	# Function to delete the directory, change "/path/to/directory" to the actual directory path
-	rm -rf "$temp_dir"
-}
-
-# Set the trap to execute the cleanup_function on getting terminated
-trap cleanup_function EXIT SIGTERM SIGINT
-
-# Function to display usage information
 function display_help() {
 	cat <<EOM
-Usage: $0 -v <nvim-version> -d <download-dir> [options]
+Usage: $0 -v <nvim-version> -d <download-path> -o <os-name> -t <download-type> -a <architecture>
 Options:
-  -v       Specify the desired Neovim version to install.
-  -d       Specify directory for storing Neovim binaries.
-           NOTE: Installation would happen in 'nvim-downloads' subdirectory.
-  -f       Force installation. Would overwrite any existing installation.
-  -m       Installation method: binary, source, system
-  -a       Architecture type of the machine
-  -o       Offline mode. Assume release is already downloaded.
+  -v       Specify the desired Neovim version to download.
+  -d       Specify directory inside which Neovim release should be downloaded.
+  -o       OS whose binary is to be downloaded.
+  -t       What to download: 'binary' or 'source'
+  -a       Specify architecture that should be downloaded.
   -h       Display this help message and exit.
 EOM
 }
 
-# Function to check if Neovim is available in the system's $PATH
-function check_neovim_in_path() {
-	if command -v nvim &>/dev/null; then
-		info "Neovim already on PATH. Skipping installation..."
-		exit 0
+# Download using wget/curl whatever is available
+function download() {
+	local url="$1"
+	local output_file="$2"
+
+	if [ "$downloader" = "curl" ]; then
+		curl -fsSL -o "$output_file" "$url"
+	elif [ "$downloader" = "wget" ]; then
+		wget --quiet --output-document="$output_file" "$url"
 	fi
 }
 
-# Function to symlink to the system Neovim
-function link_to_system_neovim() {
-	if command -v nvim &>/dev/null; then
-		rm -rf "$nvim_version_dir"
-		mkdir -p "$nvim_version_dir"/bin
-		ln -sf "$(which nvim)" "$nvim_binary"
-	else
-		error "Error: Did not find Neovim on the path"
-		exit 1
+# Get checksum
+function get_checksum() {
+	local api_url="$1"
+	local output_file="$2"
+	local tmpfile=$(mktemp)
+
+	if [ "$downloader" = "curl" ]; then
+		curl -fsSL -o "$tmpfile" "$api_url"
+	elif [ "$downloader" = "wget" ]; then
+		wget --quiet --output-document="$tmpfile" "$api_url"
 	fi
+
+	cat $tmpfile | \
+	awk -v 'OFS=  ' '
+	  # Extracts the "name" and "digest" fields from the JSON response
+	  /"assets": *\[/,/^\s*\]/ {
+		if (/"name":/) {
+		  name = $0
+		  sub(/.*"name"[[:space:]]*:[[:space:]]*/, "", name)
+		  sub(/^"/, "", name)
+		  sub(/",?$/, "", name)
+		}
+		if (/"digest":/) {
+		  digest = $0
+		  sub(/.*"digest"[[:space:]]*:[[:space:]]*/, "", digest)
+		  sub(/^"/, "", digest)
+		  sub(/",?$/, "", digest)
+		  # remove the "sha256:" prefix if it exists
+		  sub(/^sha256:/, "", digest)
+		}
+		if (/}/ && name != "" && digest != "") {
+		  print digest, name
+		  name = ""
+		  digest = ""
+		}
+	  }
+	' > "$output_file"
 }
 
-# Function to build Neovim from source
-function build_from_source() {
-	local nvim_release_name="nvim-$1-source.tar.gz"
+function download_neovim() {
+	local os="$1"
+	local version="$2"
+	local download_dir="$3"
+	local arch_type="$4"
+	local download_path=""
+	local file_name=""
 
-	if [ ! -e "$nvim_version_dir/$nvim_release_name" ]; then
-		error "Expected release to be present at $nvim_version_dir/$nvim_release_name. Aborting..."
-		exit 1
-	fi
+	local download_base_url="https://github.com/neovim/neovim/releases/download"
+	local api_base_url="https://api.github.com/repos/neovim/neovim/releases/tags"
 
-	cp "$nvim_version_dir/$nvim_release_name" "$temp_dir"
+	if [ "$os" == "Linux" ]; then
+		file_name="nvim.appimage"
+		download_path="$download_dir/nvim-$version-linux.appimage"
 
-	echo "Extracting Neovim source..."
-	tar -xzf "$temp_dir/$nvim_release_name" -C "$temp_dir"
+		set +e # Prevent termination based on compare_version's return
+		compare_versions "$version" v0.10.3
+		local result=$?
+		set -e # Re-enable termination based on return values
 
-	echo "Creating necessary directories..."
-	rm -rf "$nvim_version_dir"
-	mkdir -p "$nvim_version_dir"/bin
-
-	os_name=$(uname)
-	make="make"
-	if [[ $os_name == "FreeBSD" || $os_name == "OpenBSD" ]]; then
-		make="gmake"
-	fi
-
-	echo "Building Neovim..."
-	$make -C neovim-* CMAKE_BUILD_TYPE=Release CMAKE_INSTALL_PREFIX="$nvim_version_dir" install
-
-	echo "Building and installation done"
-}
-
-# Install on Linux using AppImage
-function setup_neovim_linux_appimage() {
-	local version="$1" arch_type="$2"
-
-	local nvim_release_name
-	local download_url
-	download_url=$(safe_subshell build_github_uri "$version" "Linux" "$arch_type")
-	nvim_release_name=$(basename "$download_url")
-	local nvim_appimage_temp_path="$temp_dir/$nvim_release_name"
-
-	if [ ! -e "$nvim_version_dir/$nvim_release_name" ]; then
-		error "Expected release to be present at $nvim_version_dir/$nvim_release_name. Aborting..."
-		exit 1
-	fi
-
-	cp "$nvim_version_dir/$nvim_release_name" "$nvim_appimage_temp_path"
-
-	info "Extracting Neovim binary..."
-	chmod u+x "$nvim_appimage_temp_path"
-	"$nvim_appimage_temp_path" --appimage-extract >/dev/null
-
-	info "Finishing up installing Neovim..."
-	mkdir -p "$nvim_version_dir"/bin
-	mv -f "$temp_dir/squashfs-root"/* "$nvim_version_dir"
-	ln -sf "$nvim_version_dir"/usr/bin/nvim "$nvim_binary"
-}
-
-# Function to download and decompress Neovim binary for macOS
-function setup_neovim_macos() {
-	local version="$1" arch_type="$2"
-
-	local nvim_release_name
-	local download_url
-	download_url=$(safe_subshell build_github_uri "$version" "Darwin" "$arch_type")
-	nvim_release_name=$(basename "$download_url")
-
-	local extract_dir="${nvim_release_name%.tar.gz}"
-	local nvim_macos_tar_path="$temp_dir/$nvim_release_name"
-	cp "$nvim_version_dir/$nvim_release_name" "$nvim_macos_tar_path"
-
-	if [ ! -e "$nvim_version_dir/$nvim_release_name" ]; then
-		error "Expected release to be present at $nvim_version_dir/$nvim_release_name"
-		exit 1
-	fi
-
-	info "Extracting Neovim binary..."
-	tar -xzf "$nvim_macos_tar_path" -C "$temp_dir"
-
-	info "Finishing up Neovim installation..."
-	mkdir -p "$nvim_version_dir"
-	mv -f "$temp_dir"/"$extract_dir"/* "$nvim_version_dir"
-
-	info "Neovim installation completed!"
-}
-
-# Function to install Neovim
-function install_neovim() {
-	# Check if the specified download directory exists
-	if [[ ! -d $remote_nvim_dir ]]; then
-		info "Remote neovim directory does not exist. Creating it now..."
-		mkdir -p "$remote_nvim_dir"
-	fi
-
-	nvim_download_dir="$remote_nvim_dir/nvim-downloads"
-
-	# Check if the specified release is already downloaded
-	nvim_version_dir="$nvim_download_dir/$nvim_version"
-	nvim_binary="$nvim_version_dir/bin/nvim"
-
-	if [[ ! $force_installation && -d $nvim_version_dir && $($nvim_binary -v 2>/dev/null | head -c1 | wc -c) -ne 0 ]]; then
-		info "Neovim ${nvim_version} is already installed. Skipping installation."
-	else
-		mkdir -p "$nvim_version_dir"
-
-		if [[ -f $nvim_binary && $($nvim_binary -v 2>/dev/null | head -c1 | wc -c) -eq 0 ]]; then
-			warn "Neovim installation is corrupted. Would re-install..."
+		if [[ $version == "nightly" ]] || [[ $version == "stable" ]] || [[ $result -eq 1 ]]; then
+			file_name="nvim-linux-${arch_type}.appimage"
+			download_path="$download_dir/nvim-$version-linux-$arch_type.appimage"
 		fi
+	elif [ "$os" == "Darwin" ]; then
+		file_name="nvim-macos.tar.gz"
+		download_path="$download_dir/nvim-$version-macos.tar.gz"
 
-		local os
-		os=$(uname)
+		set +e # Prevent termination based on compare_version's return
+		compare_versions "$version" v0.9.5
+		local result=$?
+		set -e # Re-enable termination based on return values
 
-		if [[ $install_method == "binary" ]]; then
-			if [ "$offline_mode" == true ]; then
-				info "Operating in offline mode. Will not download Neovim release"
-			else
-				"$download_neovim_script" -o "$os" -v "$nvim_version" -d "$nvim_version_dir" -t "binary" -a "$arch_type"
-			fi
-
-			# Install Neovim based on the detected OS
-			if [[ $os == "Linux" ]]; then
-				safe_subshell setup_neovim_linux_appimage "$nvim_version" "$arch_type"
-			elif [[ $os == "Darwin" ]]; then
-				safe_subshell setup_neovim_macos "$nvim_version" "$arch_type"
-			else
-				echo "Unsupported operating system: $(uname)"
-				exit 1
-			fi
-		elif [[ $install_method == "source" ]]; then
-			if [ "$offline_mode" == true ]; then
-				info "Operating in offline mode. Will not download Neovim source"
-			else
-				"$download_neovim_script" -o "$os" -v "$nvim_version" -d "$nvim_version_dir" -t "source" -a "$arch_type"
-			fi
-			safe_subshell build_from_source "$nvim_version"
-			# Handle tar file downloaded or copied over
-		elif [[ $install_method == "system" ]]; then
-			# Handle symlinking to the system binary version
-			safe_subshell link_to_system_neovim
-		else
-			error "Unsupported Neovim installation method. Available installation methods are: binary, source or system"
-			exit 1
+		if [[ $version == "nightly" ]] || [[ $version == "stable" ]] || [[ $result -eq 1 ]]; then
+			file_name="nvim-macos-${arch_type}.tar.gz"
+			download_path="$download_dir/nvim-$version-macos-$arch_type.tar.gz"
 		fi
+	else
+		echo "Error: Currently download support is present only for Linux and macOS"
+		exit 1
 	fi
 
-	info "Neovim $nvim_version can be accessed at $nvim_binary"
+	local download_url="$download_base_url/${version}/$file_name"
+
+	local checksum_path="$download_path".sha256sum
+	local expected_checksum=""
+	# This ensures that they do not match
+	local actual_checksum="$expected_checksum-actual"
+
+	if [ -e "$download_path" ] && [ -e "$checksum_path" ]; then
+		expected_checksum=$(cut -d ' ' -f 1 <"$checksum_path")
+		actual_checksum=$(sha256sum "$download_path" | cut -d ' ' -f 1)
+	fi
+
+	if [ "$actual_checksum" == "$expected_checksum" ]; then
+		echo "Existing installation with matching checksum found. Skipping downloading..."
+		return 0
+	fi
+
+	echo "Downloading Neovim..."
+	download "$download_url" "$download_path"
+
+	set +e # Prevent termination based on compare_version's return
+	compare_versions "$version" v0.10.4
+	local result=$?
+	compare_versions "$version" v0.11.3
+	local no_checksum_file=$?
+	set -e # Re-enable termination based on return values
+
+	if [[ $version == "nightly" ]] || [[ $version == "stable" ]] || [[ $no_checksum_file -le 1 ]]; then
+		# If the version is v0.11.3 or later,
+		# we can comfirm checksum from REST API
+		local temp_path="$download_path".sha256sum.tmp
+		get_checksum "$api_base_url/$version" "$temp_path"
+		cat $temp_path | grep "$file_name\$" >> "$checksum_path"
+		rm $temp_path
+	elif [[ $result -eq 1 ]]; then
+		# Since v0.11.0, checksums are gathered in shasum.txt,
+		# so we need to extract the checksum from it
+		local temp_path="$download_path".sha256sum.tmp
+		download "$download_base_url/${version}/shasum.txt" "$temp_path"
+		cat $temp_path | grep "$file_name\$" >> "$checksum_path"
+		rm $temp_path
+	else
+		download "$download_url".sha256sum "$checksum_path"
+	fi
+	echo "Download completed."
+}
+
+# Download Neovim source
+function download_neovim_source() {
+	local version="$1"
+	local download_dir="$2"
+	local download_url="https://github.com/neovim/neovim/archive/refs/tags/${version}.tar.gz"
+
+	echo "Downloading Neovim source..."
+	download "$download_url" "$download_dir/nvim-${version}-source.tar.gz"
+
+	echo "Source download completed."
 }
 
 # Parse command-line options
-while getopts "v:d:h:a:m:fo" opt; do
+while getopts "v:d:o:t:a:h" opt; do
 	case $opt in
 	v)
 		nvim_version="$OPTARG"
 		;;
-	a)
-		arch_type="$OPTARG"
-		;;
 	d)
-		remote_nvim_dir="$OPTARG"
-		;;
-	m)
-		install_method="$OPTARG"
-		;;
-	f)
-		force_installation=true
+		download_dir="$OPTARG"
 		;;
 	o)
-		offline_mode=true
+		os_name="$OPTARG"
+		;;
+	t)
+		download_type="$OPTARG"
+		;;
+	a)
+		arch_type="$OPTARG"
 		;;
 	h)
 		display_help
@@ -254,15 +213,40 @@ while getopts "v:d:h:a:m:fo" opt; do
 done
 
 # Check if the required options are provided
-if [[ -z $nvim_version || -z $remote_nvim_dir || -z $install_method || -z $arch_type ]]; then
+if [[ -z $nvim_version || -z $download_dir || -z $download_type || -z $arch_type ]]; then
 	echo "Missing options. Use -h to see the usage."
 	exit 1
 fi
 
-if [[ $install_method == "system" && $nvim_version != "system" ]]; then
-	echo "Only accepted Neovim version for linking to system Neovim is: system"
+if [[ $download_dir == *"remote-nvim.nvim/version_cache"* ]]; then
+	echo "$download_dir is the default path. So, recursively creating the necessary directories"
+	mkdir -p "$download_dir"
+fi
+
+if [[ ! -d $download_dir ]]; then
+	echo "$download_dir does not exist. Will try creating it now.."
+	if ! mkdir "$download_dir"; then
+		echo "$download_dir creation failed as parent directories do not exist"
+		exit 1
+	else
+		echo "Created $download_dir successfully"
+	fi
+fi
+
+if [[ $nvim_version != "stable" && $nvim_version != "nightly" && ! $nvim_version =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+	echo "Invalid Neovim version: $nvim_version"
 	exit 1
 fi
 
-cd "$temp_dir" || exit 1
-safe_subshell install_neovim
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+# shellcheck source=./scripts/neovim_utils.sh
+source "$SCRIPT_DIR/neovim_utils.sh"
+
+if [[ $download_type == "source" ]]; then
+	download_neovim_source "$nvim_version" "$download_dir"
+elif [[ $download_type == "system" ]]; then
+	echo "Cannot download a system-type Neovim release. Choose from either 'source' or 'binary'."
+	exit 1
+else
+	download_neovim "$os_name" "$nvim_version" "$download_dir" "$arch_type"
+fi
